@@ -1,0 +1,13 @@
+{
+  "name": "ustaadconnect-ai",
+  "version": "1.0.0",
+  "description": "WhatsApp-based AI service booking platform for Pakistan's informal economy",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix backend && npm run install:frontend",
+    "install:frontend": "npm install --prefix frontend",
+    "dev:backend": "npm run dev --prefix backend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "start": "node backend/server.js"
+  }
+}
