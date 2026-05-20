@@ -4,15 +4,12 @@ const { parseBookingMessage } = require('./gemini');
 const db = require('./database');
 
 let client = null;
-let qrCodeData = null; // Stores QR code as base64 data URI
-let connectionStatus = 'disconnected'; // 'disconnected', 'connecting', 'qr_ready', 'ready', 'error'
-let webSocketBroadcaster = null; // Placeholder for WS or SSE callback
+let qrCodeData = null;
+let connectionStatus = 'disconnected';
 
-// Conversational State Machine for WhatsApp chats
-// Key: phone number, Value: { state, bookingId, workerId, workerPhone, role: 'customer' | 'worker' }
 const sessionStates = {};
+const originalMessages = {}; // Store original msg objects for direct reply
 
-// Event callback to notify server.js about changes
 let onStatusChangeCallback = () => {};
 let onNewMessageCallback = () => {};
 
@@ -21,9 +18,6 @@ function setBroadcasters(statusCb, msgCb) {
   onNewMessageCallback = msgCb;
 }
 
-/**
- * Initialize whatsapp-web.js client
- */
 function initWhatsapp() {
   console.log('Initializing WhatsApp Client...');
   connectionStatus = 'connecting';
@@ -82,19 +76,24 @@ function initWhatsapp() {
 
     client.on('message', async (msg) => {
       try {
-        const fromPhone = msg.from.split('@')[0]; // Format: +923...
+        if (msg.from.includes('@g.us')) return;
+
+        const rawFrom = msg.id.remote || msg.from;
+        const fromPhone = rawFrom.replace('@c.us', '').replace('@lid', '');
         const messageText = msg.body;
+
+        // Store original msg for direct reply (bypasses LID issue)
+        originalMessages[fromPhone] = msg;
+
         console.log(`Received WhatsApp message from ${fromPhone}: ${messageText}`);
-        
         await handleIncomingMessage(fromPhone, messageText, false);
       } catch (err) {
         console.error('Error processing incoming WhatsApp message:', err);
       }
     });
 
-    // Start initialization without blocking server launch
     client.initialize().catch((err) => {
-      console.warn('Puppeteer launch failed for whatsapp-web.js (likely missing chromium/dependencies). Running in Simulator Mode.', err);
+      console.warn('Puppeteer launch failed. Running in Simulator Mode.', err);
       connectionStatus = 'disconnected';
       onStatusChangeCallback({ status: connectionStatus, error: 'puppeteer_failed' });
     });
@@ -106,12 +105,7 @@ function initWhatsapp() {
   }
 }
 
-/**
- * Sends a message via whatsapp-web.js if ready, otherwise logs to console
- */
 async function sendMessage(toPhone, messageContent, isSimulator = false) {
-  // Save message to Database
-  // We try to find the active booking for this phone to link the message
   let bookingId = null;
   const activeSession = sessionStates[toPhone];
   if (activeSession) {
@@ -127,7 +121,6 @@ async function sendMessage(toPhone, messageContent, isSimulator = false) {
     console.error('Failed to log outbound message in DB:', err);
   }
 
-  // Notify UI
   onNewMessageCallback({
     booking_id: bookingId,
     sender: 'system',
@@ -138,20 +131,26 @@ async function sendMessage(toPhone, messageContent, isSimulator = false) {
 
   if (connectionStatus === 'ready' && client && !isSimulator) {
     try {
-      const formattedPhone = toPhone.includes('@c.us') ? toPhone : `${toPhone}@c.us`;
-      await client.sendMessage(formattedPhone, messageContent);
-      console.log(`Sent actual WhatsApp to ${toPhone}: ${messageContent}`);
+      // Use msg.reply() to bypass LID issue
+      const originalMsg = originalMessages[toPhone];
+      if (originalMsg) {
+        await originalMsg.reply(messageContent);
+        console.log(`Replied via msg.reply() to ${toPhone}`);
+      } else {
+        // Fallback for worker notifications
+        let formattedPhone = toPhone.replace('@lid', '').replace('@c.us', '').replace(/[^0-9]/g, '');
+        formattedPhone = `${formattedPhone}@c.us`;
+        await client.sendMessage(formattedPhone, messageContent);
+        console.log(`Sent WhatsApp to ${toPhone}`);
+      }
     } catch (err) {
-      console.error(`Failed to send actual WhatsApp to ${toPhone}:`, err);
+      console.error(`Failed to send WhatsApp to ${toPhone}:`, err);
     }
   } else {
     console.log(`[SIMULATOR OUTBOUND] To ${toPhone}: ${messageContent}`);
   }
 }
 
-/**
- * Calculates estimated service pricing
- */
 function calculatePrice(service_type, urgency) {
   const basePrices = {
     plumber: 1200,
@@ -163,21 +162,14 @@ function calculatePrice(service_type, urgency) {
   };
 
   const base = basePrices[service_type] || 1000;
-  
-  // Urgency multipliers
   let multiplier = 1.0;
-  if (urgency === 'high') multiplier = 1.4; // 40% markup for emergency
-  if (urgency === 'low') multiplier = 0.85; // 15% discount for scheduled jobs
+  if (urgency === 'high') multiplier = 1.4;
+  if (urgency === 'low') multiplier = 0.85;
 
   return Math.round(base * multiplier);
 }
 
-/**
- * Main Conversational logic handler.
- * Executed for both real WhatsApp and Simulator messages.
- */
 async function handleIncomingMessage(fromPhone, messageText, isSimulator = false) {
-  // Save incoming message in database
   let bookingId = null;
   const activeSession = sessionStates[fromPhone];
   if (activeSession) {
@@ -193,7 +185,6 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
     console.error('Failed to log inbound message in DB:', err);
   }
 
-  // Notify UI
   onNewMessageCallback({
     booking_id: bookingId,
     sender: 'customer',
@@ -202,18 +193,15 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
     timestamp: new Date().toISOString()
   });
 
-  // Check if phone number is a worker who is active
   if (activeSession && activeSession.role === 'worker') {
     await handleWorkerMessage(fromPhone, messageText, activeSession, isSimulator);
     return;
   }
 
-  // Normal customer booking flow
   if (!activeSession) {
-    // 1. Initial State: Analyze request using Gemini
     console.log(`Parsing new service request from ${fromPhone}...`);
     const analysis = await parseBookingMessage(messageText);
-    console.log('Gemini Analysis Results:', analysis);
+    console.log('Analysis Results:', analysis);
 
     if (analysis.service_type === 'unknown') {
       const reply = "Assalam-o-Alaikum! UstaadConnect AI me khushamdeed. 🌟\nHamari services me Plumber, Electrician, AC Technician, Mechanic, aur Cleaner shamil hain. Aapko kis kaam k liye ustaad chahye? Apni zaroorat Roman Urdu me likh kar batayen.";
@@ -221,14 +209,11 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
       return;
     }
 
-    // 2. Find best available worker matching trade and location
-    // Try exact location first
     let worker = await db.get(
       'SELECT * FROM workers WHERE skill = ? AND location = ? AND status = ? ORDER BY rating DESC LIMIT 1',
       [analysis.service_type, analysis.location, 'available']
     );
 
-    // Fallback to any location in the same trade if exact location not available
     let locationMatched = true;
     if (!worker) {
       locationMatched = false;
@@ -244,33 +229,28 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
       return;
     }
 
-    // 3. Price Estimation
     const price = calculatePrice(analysis.service_type, analysis.urgency);
 
-    // 4. Create pending booking record
     const result = await db.run(
       `INSERT INTO bookings 
       (customer_phone, customer_name, raw_message, service_type, location, urgency, estimated_price, worker_id, status) 
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        fromPhone, 
-        analysis.customer_name || 'Customer', 
-        messageText, 
-        analysis.service_type, 
-        analysis.location, 
-        analysis.urgency, 
-        price, 
-        worker.id, 
+        fromPhone,
+        analysis.customer_name || 'Customer',
+        messageText,
+        analysis.service_type,
+        analysis.location,
+        analysis.urgency,
+        price,
+        worker.id,
         'pending_confirmation'
       ]
     );
 
     const newBookingId = result.id;
-
-    // Associate the initial message with the booking ID
     await db.run('UPDATE messages SET booking_id = ? WHERE phone = ? AND booking_id IS NULL', [newBookingId, fromPhone]);
 
-    // Create session state
     sessionStates[fromPhone] = {
       state: 'pending_confirmation',
       bookingId: newBookingId,
@@ -279,7 +259,6 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
       role: 'customer'
     };
 
-    // Format response
     const tradeLabels = {
       plumber: 'Plumber',
       electrician: 'Electrician',
@@ -294,8 +273,8 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
       low: 'Scheduled (Low)'
     };
 
-    const matchLocationMsg = locationMatched 
-      ? `Aapke ilaqay ${analysis.location} me` 
+    const matchLocationMsg = locationMatched
+      ? `Aapke ilaqay ${analysis.location} me`
       : `Hamaray paas (${worker.location}) se`;
 
     const confirmReply = `Assalam-o-Alaikum! UstaadConnect AI me khushamdeed. 🛠️\n\nHamain aapki request mil gayi hai:\n` +
@@ -311,7 +290,6 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
     await sendMessage(fromPhone, confirmReply, isSimulator);
 
   } else if (activeSession.state === 'pending_confirmation') {
-    // 5. Booking Confirmation Step
     const replyText = messageText.trim().toUpperCase();
 
     if (replyText === 'YES') {
@@ -319,19 +297,15 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
       const workerId = activeSession.workerId;
       const workerPhone = activeSession.workerPhone;
 
-      // Update booking and worker status
       await db.run("UPDATE bookings SET status = 'confirmed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [bookingId]);
       await db.run("UPDATE workers SET status = 'busy' WHERE id = ?", [workerId]);
 
-      // Get customer/booking info
       const booking = await db.get('SELECT * FROM bookings WHERE id = ?', [bookingId]);
       const worker = await db.get('SELECT * FROM workers WHERE id = ?', [workerId]);
 
-      // Reply to customer
-      const customerReply = `Shukriya! Aapki booking confirm ho gayi hai. ✅\nUstaad ${worker.name} jald hi aap se is number par rabta karen ge. Shukriya!`;
+      const customerReply = `Shukriya! Aapki booking confirm ho gayi hai. ✅\nUstaad ${worker.name} jald hi aap se rabta karen ge. Shukriya!`;
       await sendMessage(fromPhone, customerReply, isSimulator);
 
-      // Notify Worker
       const tradeLabels = {
         plumber: 'Plumbing',
         electrician: 'Electrical Repair',
@@ -347,7 +321,6 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
         `- *Estimated Price*: Rs. ${booking.estimated_price}\n\n` +
         `Kaam shuru karne k liye *START* likhen. Jab kaam mukammal ho jaye tou *COMPLETE* reply karen.`;
 
-      // Set worker state
       sessionStates[workerPhone] = {
         state: 'worker_notified',
         bookingId: bookingId,
@@ -355,35 +328,27 @@ async function handleIncomingMessage(fromPhone, messageText, isSimulator = false
         role: 'worker'
       };
 
-      // Set customer state to in progress
       sessionStates[fromPhone].state = 'confirmed';
-
-      // Send to worker
       await sendMessage(workerPhone, workerNotification, isSimulator);
 
     } else if (replyText === 'NO') {
       const bookingId = activeSession.bookingId;
       await db.run("UPDATE bookings SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [bookingId]);
-
       const cancelReply = "Aapki booking cancel kar di gayi hai. Agla order lagane k liye apna kaam likh kar send karen. Shukriya!";
       await sendMessage(fromPhone, cancelReply, isSimulator);
-
-      // Clean session
       delete sessionStates[fromPhone];
+
     } else {
-      const retryReply = "Ghalt reply! Booking confirm karne k liye sirf *YES* likhen, ya cancel karne k liye *NO* likhen.";
+      const retryReply = "Booking confirm karne k liye sirf *YES* likhen, ya cancel karne k liye *NO* likhen.";
       await sendMessage(fromPhone, retryReply, isSimulator);
     }
-  } else if (activeSession.state === 'confirmed') {
-    // Normal chat forwarding during active booking
-    const reply = "Aapka order confirm ho chuka hai aur Ustaad jald rabta krega. Order ke mutaliq mazeed guftagu k liye is number pr wait kren.";
+
+  } else if (activeSession.state === 'confirmed' || activeSession.state === 'in_progress') {
+    const reply = "Aapka order confirm ho chuka hai aur Ustaad jald rabta krega. Shukriya!";
     await sendMessage(fromPhone, reply, isSimulator);
   }
 }
 
-/**
- * Handles incoming messages from workers
- */
 async function handleWorkerMessage(workerPhone, messageText, session, isSimulator) {
   const replyText = messageText.trim().toUpperCase();
   const bookingId = session.bookingId;
@@ -391,12 +356,9 @@ async function handleWorkerMessage(workerPhone, messageText, session, isSimulato
 
   if (session.state === 'worker_notified') {
     if (replyText === 'START') {
-      // Update booking to in_progress
       await db.run("UPDATE bookings SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [bookingId]);
-      
       sessionStates[workerPhone].state = 'worker_active';
-      sessionStates[customerPhone].state = 'in_progress';
-
+      if (sessionStates[customerPhone]) sessionStates[customerPhone].state = 'in_progress';
       await sendMessage(workerPhone, `Order shuru ho chuka hai. Kaam mukammal hone par *COMPLETE* reply karen. Shukriya!`, isSimulator);
       await sendMessage(customerPhone, `Ustaad ne kaam shuru kar dia he. Mukammal hone pr aapko receipt mil jaye gi.`, isSimulator);
     } else {
@@ -404,14 +366,12 @@ async function handleWorkerMessage(workerPhone, messageText, session, isSimulato
     }
   } else if (session.state === 'worker_active') {
     if (replyText === 'COMPLETE') {
-      // Complete booking
       const booking = await db.get('SELECT * FROM bookings WHERE id = ?', [bookingId]);
       const worker = await db.get('SELECT * FROM workers WHERE id = ?', [booking.worker_id]);
 
       await db.run("UPDATE bookings SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [bookingId]);
       await db.run("UPDATE workers SET status = 'available', completed_jobs = completed_jobs + 1 WHERE id = ?", [worker.id]);
 
-      // Generate Receipt
       const receiptMsg = `--- 🧾 UstaadConnect AI Receipt ---\n\n` +
         `*Order ID*: UC-B00${bookingId}\n` +
         `*Date*: ${new Date().toLocaleDateString()}\n` +
@@ -423,13 +383,11 @@ async function handleWorkerMessage(workerPhone, messageText, session, isSimulato
         `*GST (Informal Sector)*: Rs. 0\n` +
         `*Total Payable*: Rs. ${booking.estimated_price}\n` +
         `-------------------------------\n\n` +
-        `Hamari service istemal karne ka shukriya! Ustaad ko feedback dene k liye is message ka jawab den. ⭐⭐⭐⭐⭐`;
+        `Hamari service istemal karne ka shukriya! ⭐⭐⭐⭐⭐`;
 
-      // Send confirmation to both
       await sendMessage(customerPhone, receiptMsg, isSimulator);
-      await sendMessage(workerPhone, `Shukriya Ustaad! Job completed successfully. Aap ab doosri booking k liye available hain.`, isSimulator);
+      await sendMessage(workerPhone, `Shukriya Ustaad! Job completed. Aap ab doosri booking k liye available hain.`, isSimulator);
 
-      // Clean states
       delete sessionStates[customerPhone];
       delete sessionStates[workerPhone];
     } else {
@@ -438,15 +396,12 @@ async function handleWorkerMessage(workerPhone, messageText, session, isSimulato
   }
 }
 
-/**
- * Force simulation action directly from admin dashboard (e.g. manual status transition)
- */
 async function forceCompleteJob(bookingId) {
   const booking = await db.get('SELECT * FROM bookings WHERE id = ?', [bookingId]);
   if (!booking) return false;
 
   const worker = await db.get('SELECT * FROM workers WHERE id = ?', [booking.worker_id]);
-  
+
   await db.run("UPDATE bookings SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [bookingId]);
   if (worker) {
     await db.run("UPDATE workers SET status = 'available', completed_jobs = completed_jobs + 1 WHERE id = ?", [worker.id]);
@@ -454,8 +409,7 @@ async function forceCompleteJob(bookingId) {
   }
   delete sessionStates[booking.customer_phone];
 
-  // Send fake receipt
-  const receiptMsg = `--- 🧾 UstaadConnect AI Receipt (Admin Completed) ---\n\n` +
+  const receiptMsg = `--- 🧾 UstaadConnect AI Receipt ---\n\n` +
     `*Order ID*: UC-B00${bookingId}\n` +
     `*Date*: ${new Date().toLocaleDateString()}\n` +
     `*Ustaad*: ${worker ? worker.name : 'Unknown'} (${booking.service_type.replace('_', ' ')})\n` +
@@ -463,7 +417,6 @@ async function forceCompleteJob(bookingId) {
     `*Location*: ${booking.location}\n\n` +
     `-------------------------------\n` +
     `*Service Charge*: Rs. ${booking.estimated_price}\n` +
-    `*GST (Informal Sector)*: Rs. 0\n` +
     `*Total Payable*: Rs. ${booking.estimated_price}\n` +
     `-------------------------------\n\n` +
     `Thank you for using UstaadConnect AI!`;
